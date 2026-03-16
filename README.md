@@ -149,11 +149,11 @@ pytest tests/test_feedback_integration.py -v
 2. Replace the sample implementation with your own
 3. Make sure `docker compose up` works and passes the health check
 4. Push to your fork
-5. **Fill out the [submission form](https://forms.gle/5kNAYek5QnjSGwZR7)** with your name, email, and the link to your fork
+5. **Fill out the [submission form](https://forms.gle/Nb2aqYvtY12efX2bA)** with your name, email, and the link to your fork
 
 **Use the same email you applied with on Handshake.** This is how we match your submission to your application.
 
-**Deadline:** One week from the date the task is sent. The exact deadline will be in the announcement email.
+**Deadline: Sunday, March 22, 2026 at 11:59 PM Eastern Time.** Late submissions will not be evaluated.
 
 ## How Submissions Are Evaluated
 
@@ -161,7 +161,7 @@ pytest tests/test_feedback_integration.py -v
 | -------------------------- | ------ | ----------- | ---------------------------------------------------------------------------------------------- |
 | **Runs successfully**      | Gate   | Automated   | Server starts via Docker and responds to health check. **Fail = disqualified.**                |
 | **Schema compliance**      | Gate   | Automated   | ≥90% of responses match JSON schema. **Below threshold = disqualified.**                       |
-| **Response time**           | Gate   | Automated   | Each `/feedback` request must return within 30 seconds. **Timeouts = failures.**               |
+| **Response time**          | Gate   | Automated   | Each `/feedback` request must return within 30 seconds. **Timeouts = failures.**               |
 | **Accuracy**               | 25%    | Absolute    | Corrections are linguistically accurate across a hidden test suite spanning multiple languages |
 | **Production feasibility** | 25%    | Comparative | Could this run at scale? Model choice, token efficiency, caching, cost reduction strategy      |
 | **Test quality**           | 25%    | Comparative | Your tests are meaningful, cover edge cases, and test real behavior                            |
