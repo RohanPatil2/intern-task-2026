@@ -1,25 +1,55 @@
-"""FastAPI application -- language feedback endpoint."""
+"""FastAPI application entry point.
 
-from dotenv import load_dotenv
+Responsibilities here are intentionally minimal:
+  - Create the FastAPI instance with metadata.
+  - Register the router from app.api.routes.
+  - Validate required config at startup via the lifespan hook.
+
+All business logic lives in app/services/, all routes in app/api/routes.py.
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
 from fastapi import FastAPI
 
-from app.feedback import get_feedback
-from app.models import FeedbackRequest, FeedbackResponse
+from app.api.routes import router
+from app.core.config import settings
 
-load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Run startup checks before the server accepts requests.
+
+    Raises:
+        RuntimeError: If ANTHROPIC_API_KEY is missing — fail fast rather than
+            accepting requests that will immediately fail at the LLM call.
+    """
+    if not settings.anthropic_api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. "
+            "Copy .env.example to .env and add your key."
+        )
+    logger.info("Starting Language Feedback API (model=%s)", settings.model)
+    yield
+    logger.info("Language Feedback API shutting down")
+
 
 app = FastAPI(
     title="Language Feedback API",
-    description="Analyzes learner-written sentences and provides structured language feedback.",
+    description=(
+        "LLM-powered grammar correction for language learners. "
+        "POST /feedback to analyse a sentence; GET /health for a liveness probe."
+    ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.post("/feedback", response_model=FeedbackResponse)
-async def feedback(request: FeedbackRequest) -> FeedbackResponse:
-    return await get_feedback(request)
+app.include_router(router)

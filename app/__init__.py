@@ -1,1 +1,1 @@
-"""Language Feedback API -- sample submission for Pangea Chat intern task."""
+"""Language Feedback API — LLM-powered grammar correction for language learners."""

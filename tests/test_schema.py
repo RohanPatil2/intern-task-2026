@@ -5,7 +5,7 @@ from pathlib import Path
 
 import jsonschema
 import pytest
-from app.models import FeedbackRequest, FeedbackResponse
+from app.models.schemas import FeedbackRequest, FeedbackResponse  # noqa: F401 (imported for type checking)
 
 SCHEMA_DIR = Path(__file__).parent.parent / "schema"
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
