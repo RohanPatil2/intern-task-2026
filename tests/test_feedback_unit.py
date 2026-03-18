@@ -195,12 +195,7 @@ async def test_cache_hit_skips_llm_on_second_identical_request():
     """
     sentence = "Je mange une pomme chaque matin."
     request = _make_request(sentence, target="French")
-
-    from app.services.cache import _cache, _lock
-
-    with _lock:
-        _cache.clear()
-
+    # Cache is cleared automatically by conftest.py before every test.
     call_count = 0
 
     async def counting_mock(*args, **kwargs) -> dict:
@@ -341,10 +336,6 @@ async def test_few_shot_prefix_included_and_merged_correctly_in_anthropic_call()
         captured.extend(messages)
         return _correct_raw("Test sentence.")
 
-    from app.services.cache import _cache, _lock
-    with _lock:
-        _cache.clear()
-
     with patch("app.services.llm._call_anthropic", new=capturing_mock):
         await LLMService().get_feedback(_make_request("Test sentence.", target="English"))
 
@@ -383,13 +374,7 @@ async def test_in_flight_dedup_fires_only_one_llm_call_for_concurrent_requests()
     sentence = "Bonjour le monde."
     request = _make_request(sentence, target="French")
 
-    from app.services.cache import _cache, _lock
-    from app.services.llm import _in_flight
-
-    # Clear state so prior test runs don't pollute this one.
-    with _lock:
-        _cache.clear()
-    _in_flight.clear()
+    # Cache and in-flight map are cleared automatically by conftest.py.
 
     call_count = 0
     # Introduce a small delay to ensure concurrent requests actually overlap.

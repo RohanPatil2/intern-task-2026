@@ -33,19 +33,6 @@ VALID_ERROR_TYPES = {
 VALID_DIFFICULTIES = {"A1", "A2", "B1", "B2", "C1", "C2"}
 
 
-@pytest.fixture(autouse=True)
-def clear_cache():
-    """Clear the in-memory cache before every integration test.
-
-    Without this, a passing test could seed the cache and cause a subsequent
-    test with the same sentence to skip the real LLM call, hiding regressions.
-    """
-    from app.services.cache import _cache, _lock
-
-    with _lock:
-        _cache.clear()
-    yield
-
 
 @pytest.mark.asyncio
 async def test_integration_spanish_conjugation_error_detected():
