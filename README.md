@@ -397,6 +397,80 @@ This keeps the deployment a single container with no external dependencies. The 
 
 `A1` (beginner) → `A2` → `B1` → `B2` → `C1` → `C2` (mastery)
 ---
+---
+
+## 🔭 What I Would Do Differently at Production Scale
+
+Transitioning this API from a functional prototype to a high-throughput educational inference platform requires a systemic shift across the protocol, inference, caching, and observability layers. At production scale — serving thousands of concurrent language learners across a live classroom ecosystem — the current in-process, single-worker design becomes the primary bottleneck. Preserving the pedagogical requirement of sub-second feedback immediacy demands architectural changes at every layer of the stack.
+
+Here is my technical roadmap for scaling:
+
+---
+
+### 1. 🔄 Protocol & Response Delivery (Eliminating Perceived Latency)
+
+**Migrate `POST /feedback` to Server-Sent Events (SSE) streaming.**
+The current design holds the HTTP connection open until the full LLM response is available, then delivers it atomically. For a learner staring at a loading spinner, even a 1.5-second response *feels* slow. By streaming the Anthropic response token-by-token via SSE, the corrected sentence and the first error explanation appear in under 300 ms — the remainder streams in progressively. This transforms a "wait, then read" experience into a "see it appear" experience, which is measurably more engaging for learners.
+
+```
+Current:  [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 1600 ms → full response
+Streamed: [▓░░░░░░░░░░░░░░]  280 ms → first token visible, rest streams in
+```
+
+**Adopt HTTP/2 with connection multiplexing for batch requests.**
+`POST /feedback/batch` currently issues N parallel HTTP/1.1 connections to the Anthropic API. Migrating to HTTP/2 allows all N concurrent streams to share a single TCP connection, eliminating per-stream TLS handshake overhead and dramatically reducing batch latency under classroom-sized loads (30 students submitting simultaneously).
+
+---
+
+### 2. ⚙️ Backend Architecture & Worker Isolation
+
+**Replace the in-process TTL cache with Redis.**
+The current `cachetools.TTLCache` is process-local — it cannot be shared across multiple uvicorn workers or horizontally scaled containers. Under real load, each worker builds its own independent cache, multiplying redundant LLM calls by the number of workers. Replacing the two functions in `cache.py` (`get_cached` / `set_cached`) with `redis.asyncio` gives a single shared cache across all workers, all containers, and all availability zones — with zero application-layer changes.
+
+```
+Single worker (current):  Worker A cache ─── Worker B cache (separate, no sharing)
+Redis backend (scaled):   Worker A ──┐
+                          Worker B ──┼──▶ Redis (shared, persistent across restarts)
+                          Worker C ──┘
+```
+
+**Decouple the AI inference pipeline from the HTTP request lifecycle.**
+At classroom scale, a single slow LLM call (e.g. a complex C1-level sentence) can exhaust the uvicorn worker pool and block simpler A1-level requests. I would introduce a task queue (Celery + Redis or ARQ) to decouple HTTP request handling from LLM inference: the API immediately returns a `202 Accepted` with a `task_id`, and the client polls `GET /feedback/{task_id}` or subscribes to an SSE channel for the result. This prevents any single slow inference from degrading latency for the entire classroom.
+
+**Implement smart model routing by detected CEFR complexity.**
+Not every sentence needs Claude Haiku 4.5. A preliminary classifier (a lightweight embedding model or even a simple heuristic on sentence length and vocabulary) can bucket sentences into complexity tiers:
+- `A1–A2` → Claude Haiku 4.5 (fast, cheap, sufficient)
+- `B2–C2` → Claude Sonnet 4.6 (higher accuracy for complex grammar)
+
+This hybrid routing strategy captures the cost profile of Haiku for ~70% of requests while ensuring accuracy on the 30% that actually need a stronger model.
+
+---
+
+### 3. 🧠 LLM Inference Optimization
+
+**Implement semantic cache deduplication with embedding similarity.**
+The current SHA-256 cache only hits on *exact* string matches — `"I go to store"` and `"I go to the store."` are treated as completely different keys despite being near-identical. At scale, I would add a vector similarity layer (FAISS or pgvector) that checks whether an incoming sentence is semantically equivalent to a cached entry within a cosine similarity threshold. This dramatically increases effective cache hit rate for common learner patterns, where minor punctuation differences shouldn't trigger a fresh LLM call.
+
+**Tune `max_tokens` dynamically based on detected error density.**
+The current `max_tokens=1024` is a conservative static ceiling. A preliminary pass (zero-shot classifier or simple character-level heuristic) can estimate whether a sentence is likely correct (→ 256 tokens sufficient) or contains multiple errors (→ keep 1 024). This reduces average output token cost by ~40% for correct or near-correct sentences, which make up a disproportionately large share of real-world submissions from intermediate learners.
+
+---
+
+### 4. 📊 Observability & Cost Governance
+
+**Replace `logging` with structured OpenTelemetry traces.**
+The current per-request log lines are human-readable but machine-unqueryable. I would emit structured spans via the OpenTelemetry SDK — one root span per `/feedback` request with child spans for cache lookup, in-flight check, LLM call (with token counts as span attributes), and Pydantic validation. This gives the engineering team a live cost dashboard: P95 latency by language, token spend by error type, cache hit rate by CEFR level — all derived from trace data with no additional instrumentation.
+
+**Enforce per-tenant rate limiting and cost budgets.**
+A single classroom abusing the batch endpoint could consume a disproportionate share of the LLM budget. I would add `slowapi` middleware with per-IP and per-API-key rate limits, and a configurable hard cap on daily token spend per tenant (tracked in Redis). When a tenant approaches their limit, the API returns `429 Too Many Requests` with a `Retry-After` header — fail gracefully, never silently.
+
+---
+
+> **The key principle:** every component in the current architecture — the cache backend, the model choice, the HTTP protocol, the logging format — was deliberately designed with a clear swap path. The interfaces are stable; only the implementations need to change to go from prototype to production.
+
+---
+
+
 
 <div align="center">
 
