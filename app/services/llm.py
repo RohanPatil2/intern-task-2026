@@ -33,6 +33,35 @@ from app.models.schemas import ErrorDetail, FeedbackRequest, FeedbackResponse
 from app.services import cache as cache_service
 from app.services.prompts import ACTIVE_SYSTEM_PROMPT, ACTIVE_USER_PROMPT
 
+# Anthropic's tool-use schema guides (but does not strictly enforce) enum values.
+# If the model returns an unrecognised error_type (e.g. "case", "tense"),
+# we normalise it to "other" so Pydantic validation never fails on a real error.
+_VALID_ERROR_TYPES = frozenset(
+    [
+        "grammar", "spelling", "word_choice", "punctuation", "word_order",
+        "missing_word", "extra_word", "conjugation", "gender_agreement",
+        "number_agreement", "tone_register", "other",
+    ]
+)
+
+
+def _normalise_error(raw_error: dict) -> dict:
+    """Return a copy of raw_error with error_type coerced to a valid enum value.
+
+    Args:
+        raw_error: Dict from the LLM tool_use block representing one error.
+
+    Returns:
+        The same dict with error_type guaranteed to be in _VALID_ERROR_TYPES.
+    """
+    error_type = raw_error.get("error_type", "other")
+    if error_type not in _VALID_ERROR_TYPES:
+        logger.warning(
+            "LLM returned unknown error_type %r — remapping to 'other'", error_type
+        )
+        raw_error = {**raw_error, "error_type": "other"}
+    return raw_error
+
 logger = logging.getLogger(__name__)
 
 # ── Singleton Anthropic async client ─────────────────────────────────────────
@@ -236,12 +265,13 @@ class LLMService:
 
         raw = await _call_anthropic(system_prompt, user_message)
 
-        # Pydantic validates enum membership for error_type and difficulty,
-        # catching any schema drift before it reaches the caller.
+        # Normalise each error before Pydantic validation so an unexpected
+        # error_type from the LLM (e.g. "case") maps to "other" rather than
+        # raising a ValidationError and dropping valid linguistic feedback.
         response = FeedbackResponse(
             corrected_sentence=raw["corrected_sentence"],
             is_correct=raw["is_correct"],
-            errors=[ErrorDetail(**e) for e in raw.get("errors", [])],
+            errors=[ErrorDetail(**_normalise_error(e)) for e in raw.get("errors", [])],
             difficulty=raw["difficulty"],
         )
 
