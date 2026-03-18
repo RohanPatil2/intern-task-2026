@@ -118,7 +118,7 @@ A `POST /feedback` request lands on FastAPI. Before anything else, **Pydantic v2
 A **SHA-256 hash** of the sentence + target language + native language is computed. This hash is checked against an in-memory **TTL cache** (1-hour lifetime, 1 000 entries max). If this exact sentence has been asked before, the stored response is returned *instantly* — zero API tokens consumed.
 
 ### Step 3 — In-flight deduplication (Layer 2)
-If the sentence *isn't* in the cache, the code checks a second map: are there already concurrent requests for this same sentence right now? If yes, this request **shares the Future** of the first request — it waits for it to finish and receives the same result. This prevents 30 students submitting the same exercise from triggering 30 separate LLM calls.
+If the sentence isn't in the cache, the code checks a second map: are there already concurrent requests for the same sentence? If yes, this request **shares the Future** of the first request — it waits for it to finish and receives the same result. This prevents 30 students from submitting the same exercise from triggering 30 separate LLM calls.
 
 ```
 Request A ──▶ cache miss ──▶ starts LLM call ──┐
@@ -396,19 +396,6 @@ This keeps the deployment a single container with no external dependencies. The 
 ## 📊 CEFR Difficulty Levels
 
 `A1` (beginner) → `A2` → `B1` → `B2` → `C1` → `C2` (mastery)
-
----
-
-## 📋 Scoring Criteria — Self-Assessment
-
-| Criterion | What this submission does |
-|---|---|
-| **Prompt engineering** | Versioned system prompt + turn-based few-shot with Anthropic tool-use. Forced structured output — not a request. Anti-hallucination guardrails for correct sentences. Encouraging tone for learner UX. |
-| **Software craft** | Modular service-oriented architecture (api / core / models / services). Typed everywhere with Pydantic v2. 30 tests across 3 files: unit (mocked), integration (real API), schema. `conftest.py` ensures clean test isolation. No silent failures — every error is caught, logged, and surfaced cleanly. |
-| **Product thinking** | Batch endpoint for teachers. Explanations in native language. Minimal corrections. Encouraging tone. CEFR difficulty for curriculum alignment. Supports all world scripts. Correct sentences return `is_correct: true` — no phantom errors. |
-| **Cost-effectiveness** | Claude Haiku 4.5: cheapest frontier model ($1/M input tokens). 1 024 max tokens per call (tuned, not default). Two-layer dedup: TTL cache + asyncio in-flight map. Popular sentences never hit the LLM twice. `GET /stats` shows live hit rate for cost monitoring. |
-| **Communication** | This README. Seven-step plain-English walkthrough with a flow diagram. Explicit prompt strategy section. Design decisions with *why*, not just *what*. Production scaling path. |
-
 ---
 
 <div align="center">
