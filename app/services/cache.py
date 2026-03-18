@@ -1,4 +1,4 @@
-"""In-memory TTL cache for FeedbackResponse objects.
+"""In-memory TTL cache for FeedbackResponse objects with hit/miss telemetry.
 
 Architecture note:
   Using cachetools.TTLCache (in-process memory) rather than Redis keeps the
@@ -12,8 +12,11 @@ Architecture note:
 Cache key design:
   SHA-256 of "{sentence}|{target_language}|{native_language}" (all normalised
   to lower-case with leading/trailing whitespace stripped) gives a fixed-size,
-  collision-resistant key that is safe to use as a dict key regardless of the
-  input language or script.
+  collision-resistant key safe for any script or language.
+
+Telemetry:
+  _hits / _misses counters are exposed via get_stats() which the GET /stats
+  endpoint reads to give operators real-time visibility into cache efficiency.
 """
 
 import hashlib
@@ -30,10 +33,13 @@ _cache: TTLCache = TTLCache(
     ttl=settings.cache_ttl_seconds,
 )
 
-# TTLCache is not thread-safe, so protect every read/write with a lock.
-# Since LLM calls are async and we release the GIL during I/O, a threading
-# Lock is sufficient here; no asyncio.Lock needed.
+# TTLCache is not thread-safe, so every read/write is guarded by this lock.
 _lock = Lock()
+
+# Simple hit/miss counters for the /stats endpoint.
+# Using plain ints (not atomics) is safe because the GIL serialises increments.
+_hits: int = 0
+_misses: int = 0
 
 
 def make_cache_key(sentence: str, target_language: str, native_language: str) -> str:
@@ -48,7 +54,7 @@ def make_cache_key(sentence: str, target_language: str, native_language: str) ->
         64-character lower-hex SHA-256 digest.
     """
     # Normalise to avoid cache misses from irrelevant formatting differences
-    # such as trailing spaces or inconsistent capitalisation ("Spanish" vs "spanish").
+    # such as trailing spaces or inconsistent capitalisation.
     payload = (
         f"{sentence.strip()}"
         f"|{target_language.lower().strip()}"
@@ -60,14 +66,22 @@ def make_cache_key(sentence: str, target_language: str, native_language: str) ->
 def get_cached(key: str) -> FeedbackResponse | None:
     """Return a previously cached response, or None if absent / expired.
 
+    Increments the hit or miss counter for telemetry.
+
     Args:
         key: Cache key produced by :func:`make_cache_key`.
 
     Returns:
         The cached FeedbackResponse, or None on a cache miss.
     """
+    global _hits, _misses
     with _lock:
-        return _cache.get(key)
+        result = _cache.get(key)
+        if result is not None:
+            _hits += 1
+        else:
+            _misses += 1
+        return result
 
 
 def set_cached(key: str, value: FeedbackResponse) -> None:
@@ -79,3 +93,27 @@ def set_cached(key: str, value: FeedbackResponse) -> None:
     """
     with _lock:
         _cache[key] = value
+
+
+def get_stats() -> dict:
+    """Return a snapshot of cache metrics for the /stats endpoint.
+
+    Returns:
+        Dict with keys: cache_size, cache_maxsize, hits, misses, hit_rate.
+    """
+    global _hits, _misses
+    with _lock:
+        size = len(_cache)
+        hits = _hits
+        misses = _misses
+
+    total = hits + misses
+    return {
+        "cache_size": size,
+        "cache_maxsize": settings.cache_max_size,
+        "cache_ttl_seconds": settings.cache_ttl_seconds,
+        "hits": hits,
+        "misses": misses,
+        # hit_rate is 0.0 until at least one request has been processed.
+        "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
+    }

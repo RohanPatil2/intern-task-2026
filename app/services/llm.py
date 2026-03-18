@@ -1,22 +1,31 @@
-"""Anthropic LLM service: structured tool-use outputs, retry logic, and caching.
+"""Anthropic LLM service: tool-use outputs, retry, caching, and in-flight dedup.
 
 Key design decisions:
-  1. Tool-use with tool_choice={"type":"tool"} forces the model to *always*
-     call the language_feedback tool, giving us mathematically guaranteed
-     JSON schema compliance — no raw-string parsing, no json.loads guesswork.
+  1. Tool-use + tool_choice={"type":"tool"} forces the model to always call the
+     language_feedback tool — mathematically guaranteed schema compliance.
 
-  2. tenacity wraps the raw API call with exponential back-off so transient
-     rate-limit or connection errors are retried transparently before the
-     caller ever sees an exception.
+  2. Turn-based few-shot examples are prepended to every messages list.
+     This is the correct technique for Anthropic tool-use: the model sees
+     real tool_use blocks in prior turns, not schema descriptions in text.
 
-  3. The Anthropic async client is a module-level singleton so HTTP connection
-     pools are reused across requests, keeping per-call latency low.
+  3. tenacity wraps the raw API call with exponential back-off for the four
+     transient error types (rate-limit, connection, timeout, server-error).
 
-  4. All cached lookups happen *before* the LLM call, so a cache hit costs
-     ~0 ms and zero tokens.
+  4. The Anthropic async client is a module-level singleton — HTTP connection
+     pools are reused across requests.
+
+  5. Two-layer deduplication:
+       Layer 1 — persistent TTL cache: zero tokens on cache hit.
+       Layer 2 — in-flight Future map: if N concurrent requests for the SAME
+                 sentence arrive before the first completes, only ONE LLM call
+                 fires; all N waiters share its result via asyncio.shield().
+                 This prevents the "thundering herd" problem on popular
+                 exercises (e.g. a whole class submitting the same sentence).
 """
 
+import asyncio
 import logging
+from asyncio import Future
 from typing import Any
 
 import anthropic
@@ -31,11 +40,20 @@ from tenacity import (
 from app.core.config import settings
 from app.models.schemas import ErrorDetail, FeedbackRequest, FeedbackResponse
 from app.services import cache as cache_service
-from app.services.prompts import ACTIVE_SYSTEM_PROMPT, ACTIVE_USER_PROMPT
+from app.services.prompts import (
+    ACTIVE_FEW_SHOT_LAST_TOOL_USE_ID,
+    ACTIVE_FEW_SHOT_PREFIX,
+    ACTIVE_SYSTEM_PROMPT,
+    ACTIVE_USER_PROMPT,
+)
 
+logger = logging.getLogger(__name__)
+
+# ── Enum normalisation ────────────────────────────────────────────────────────
 # Anthropic's tool-use schema guides (but does not strictly enforce) enum values.
 # If the model returns an unrecognised error_type (e.g. "case", "tense"),
-# we normalise it to "other" so Pydantic validation never fails on a real error.
+# we normalise it to "other" rather than raising a ValidationError that would
+# discard otherwise valid feedback.
 _VALID_ERROR_TYPES = frozenset(
     [
         "grammar", "spelling", "word_choice", "punctuation", "word_order",
@@ -46,36 +64,27 @@ _VALID_ERROR_TYPES = frozenset(
 
 
 def _normalise_error(raw_error: dict) -> dict:
-    """Return a copy of raw_error with error_type coerced to a valid enum value.
+    """Return raw_error with error_type coerced to a valid enum value.
 
     Args:
         raw_error: Dict from the LLM tool_use block representing one error.
 
     Returns:
-        The same dict with error_type guaranteed to be in _VALID_ERROR_TYPES.
+        The same dict, with error_type guaranteed to be in _VALID_ERROR_TYPES.
     """
     error_type = raw_error.get("error_type", "other")
     if error_type not in _VALID_ERROR_TYPES:
-        logger.warning(
-            "LLM returned unknown error_type %r — remapping to 'other'", error_type
-        )
+        logger.warning("LLM returned unknown error_type %r — remapping to 'other'", error_type)
         raw_error = {**raw_error, "error_type": "other"}
     return raw_error
 
-logger = logging.getLogger(__name__)
 
 # ── Singleton Anthropic async client ─────────────────────────────────────────
-# One client per process; the underlying httpx.AsyncClient handles connection
-# pooling automatically.
 _client: anthropic.AsyncAnthropic | None = None
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
-    """Return (or lazily initialise) the shared Anthropic async client.
-
-    Returns:
-        The module-level AsyncAnthropic instance.
-    """
+    """Return (or lazily initialise) the shared Anthropic async client."""
     global _client
     if _client is None:
         _client = anthropic.AsyncAnthropic(
@@ -85,9 +94,31 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return _client
 
 
+# ── In-flight request deduplication ──────────────────────────────────────────
+# Maps cache_key → asyncio.Future[FeedbackResponse].
+#
+# When two or more concurrent requests for the exact same sentence arrive:
+#   - The first request creates a Future and begins the LLM call.
+#   - Subsequent requests find the key in _in_flight and await the same Future.
+#   - When the first request resolves, ALL waiters receive the result instantly.
+#
+# asyncio is single-threaded, so the check `if key in _in_flight` followed by
+# `_in_flight[key] = future` is effectively atomic (no await between them).
+_in_flight: dict[str, Future[FeedbackResponse]] = {}
+
+
+def get_in_flight_count() -> int:
+    """Return the number of LLM calls currently in progress.
+
+    Used by the /stats endpoint for real-time observability.
+
+    Returns:
+        Number of active in-flight requests.
+    """
+    return len(_in_flight)
+
+
 # ── Tool definition ───────────────────────────────────────────────────────────
-# Defining the tool schema here (rather than inline in the API call) makes it
-# easy to version and review alongside the prompt templates.
 _FEEDBACK_TOOL: dict[str, Any] = {
     "name": "language_feedback",
     "description": "Return structured language feedback for a learner's sentence.",
@@ -115,26 +146,10 @@ _FEEDBACK_TOOL: dict[str, Any] = {
                             "type": "string",
                             "description": "Erroneous word or phrase from the original sentence.",
                         },
-                        "correction": {
-                            "type": "string",
-                            "description": "Corrected replacement.",
-                        },
+                        "correction": {"type": "string", "description": "Corrected replacement."},
                         "error_type": {
                             "type": "string",
-                            "enum": [
-                                "grammar",
-                                "spelling",
-                                "word_choice",
-                                "punctuation",
-                                "word_order",
-                                "missing_word",
-                                "extra_word",
-                                "conjugation",
-                                "gender_agreement",
-                                "number_agreement",
-                                "tone_register",
-                                "other",
-                            ],
+                            "enum": list(_VALID_ERROR_TYPES),
                         },
                         "explanation": {
                             "type": "string",
@@ -155,13 +170,6 @@ _FEEDBACK_TOOL: dict[str, Any] = {
 }
 
 # ── Retry-wrapped API call ────────────────────────────────────────────────────
-# Retry on the four exception types that are safe to retry (all are transient):
-#   - RateLimitError  : 429, back off and retry
-#   - APIConnectionError: DNS / TCP failure, retry
-#   - APITimeoutError : request timed out at the HTTP level, retry
-#   - InternalServerError: Anthropic 500, retry
-# Any other exception (AuthenticationError, BadRequestError, etc.) propagates
-# immediately — retrying those would waste tokens and time.
 @retry(
     retry=retry_if_exception_type(
         (
@@ -176,32 +184,36 @@ _FEEDBACK_TOOL: dict[str, Any] = {
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-async def _call_anthropic(system: str, user_content: str) -> dict[str, Any]:
+async def _call_anthropic(
+    system: str,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
     """Send a request to the Anthropic API and extract the tool_use block.
+
+    The messages list should already include any few-shot examples followed
+    by the actual user message — this function is purely transport.
 
     Args:
         system: System prompt string.
-        user_content: Formatted user message string.
+        messages: Full messages list (few-shot turns + user request).
 
     Returns:
         The raw dict from the ``tool_use`` block's ``input`` field.
 
     Raises:
-        ValueError: If the response contains no ``tool_use`` block
-            (should be unreachable given tool_choice enforcement).
+        ValueError: If the response contains no ``tool_use`` block.
         anthropic.*Error: Re-raised after all retry attempts are exhausted.
     """
     client = _get_client()
     response = await client.messages.create(
         model=settings.model,
-        # 1024 tokens is ample for structured feedback on a single sentence;
-        # keeping max_tokens low reduces worst-case latency and cost.
+        # 1024 tokens covers any single-sentence feedback with room to spare.
+        # Keeping this low minimises worst-case latency and cost per request.
         max_tokens=1024,
         system=system,
-        messages=[{"role": "user", "content": user_content}],
+        messages=messages,
         tools=[_FEEDBACK_TOOL],
-        # tool_choice={"type":"tool"} forces the model to call language_feedback
-        # on every request — it cannot emit a plain-text response.
+        # Forcing tool use means the model can never fall back to plain text.
         tool_choice={"type": "tool", "name": "language_feedback"},
     )
 
@@ -209,40 +221,39 @@ async def _call_anthropic(system: str, user_content: str) -> dict[str, Any]:
         if block.type == "tool_use":
             return block.input  # type: ignore[return-value]
 
-    # This branch is unreachable under normal operation but provides a clear
-    # error message if Anthropic ever changes its tool_choice behaviour.
-    raise ValueError("Anthropic response contained no tool_use block — check tool_choice config")
+    raise ValueError(
+        "Anthropic response contained no tool_use block — check tool_choice config"
+    )
 
 
 # ── Service class ─────────────────────────────────────────────────────────────
 
 
 class LLMService:
-    """Orchestrates prompt construction, LLM calls, caching, and response parsing.
+    """Orchestrates few-shot prompting, LLM calls, deduplication, and caching.
 
-    This class is intentionally stateless so it is safe to share as a singleton
-    across all concurrent requests via FastAPI's dependency injection system.
+    Stateless by design — safe to share as a singleton across all concurrent
+    requests via FastAPI's dependency injection.
     """
 
     async def get_feedback(self, request: FeedbackRequest) -> FeedbackResponse:
-        """Return structured language feedback, hitting the cache when possible.
+        """Return structured language feedback with two-layer deduplication.
 
-        Flow:
+        Request flow:
           1. Compute deterministic cache key.
-          2. Return cached result immediately on a hit (zero LLM tokens used).
-          3. On a miss: build prompts, call Anthropic with retry logic,
-             parse the tool_use output through Pydantic, store in cache.
+          2. Layer 1 — cache hit: return stored result (0 ms, 0 tokens).
+          3. Layer 2 — in-flight hit: await the Future from an identical
+             concurrent request (0 extra tokens, minimal latency).
+          4. Miss: build few-shot messages, call Anthropic, parse, cache.
 
         Args:
             request: Validated FeedbackRequest from the API layer.
 
         Returns:
-            A FeedbackResponse conforming to the JSON schema.
+            FeedbackResponse conforming to the JSON schema.
 
         Raises:
-            pydantic.ValidationError: If the LLM returns data that violates
-                the schema constraints (e.g. an unknown error_type).
-            anthropic.*Error: If all retry attempts fail.
+            anthropic.*Error: If all retry attempts are exhausted.
         """
         cache_key = cache_service.make_cache_key(
             request.sentence,
@@ -250,36 +261,84 @@ class LLMService:
             request.native_language,
         )
 
-        # Fast path — no network call, no tokens consumed.
+        # ── Layer 1: persistent cache ─────────────────────────────────────────
         cached = cache_service.get_cached(cache_key)
         if cached is not None:
             logger.info("Cache hit [key=%s…]", cache_key[:8])
             return cached
 
-        system_prompt = ACTIVE_SYSTEM_PROMPT
-        user_message = ACTIVE_USER_PROMPT.format(
-            sentence=request.sentence,
-            target_language=request.target_language,
-            native_language=request.native_language,
-        )
+        # ── Layer 2: in-flight deduplication ─────────────────────────────────
+        # No await between the check and the assignment, so this is atomic
+        # under asyncio's single-threaded execution model.
+        if cache_key in _in_flight:
+            logger.info("In-flight dedup hit [key=%s…]", cache_key[:8])
+            # asyncio.shield ensures that if THIS coroutine is cancelled, the
+            # underlying Future (owned by the first request) keeps running and
+            # other waiters still receive their result.
+            return await asyncio.shield(_in_flight[cache_key])
 
-        raw = await _call_anthropic(system_prompt, user_message)
+        loop = asyncio.get_running_loop()
+        future: Future[FeedbackResponse] = loop.create_future()
+        _in_flight[cache_key] = future
 
-        # Normalise each error before Pydantic validation so an unexpected
-        # error_type from the LLM (e.g. "case") maps to "other" rather than
-        # raising a ValidationError and dropping valid linguistic feedback.
-        response = FeedbackResponse(
-            corrected_sentence=raw["corrected_sentence"],
-            is_correct=raw["is_correct"],
-            errors=[ErrorDetail(**_normalise_error(e)) for e in raw.get("errors", [])],
-            difficulty=raw["difficulty"],
-        )
+        try:
+            user_message = ACTIVE_USER_PROMPT.format(
+                sentence=request.sentence,
+                target_language=request.target_language,
+                native_language=request.native_language,
+            )
+            # Build the full messages list:
+            #   FEW_SHOT_PREFIX  (examples A and B, ending with assistant tool_use)
+            #   + one merged user turn containing:
+            #       - the tool_result for the last few-shot tool_use (required
+            #         by Anthropic: every tool_use must be followed by a result)
+            #       - the actual user request as a text block
+            # This avoids consecutive user messages while satisfying the API rule.
+            messages = ACTIVE_FEW_SHOT_PREFIX + [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": ACTIVE_FEW_SHOT_LAST_TOOL_USE_ID,
+                            "content": "Feedback recorded.",
+                        },
+                        {"type": "text", "text": user_message},
+                    ],
+                }
+            ]
 
-        cache_service.set_cached(cache_key, response)
-        logger.info(
-            "LLM call complete [is_correct=%s, errors=%d, difficulty=%s]",
-            response.is_correct,
-            len(response.errors),
-            response.difficulty,
-        )
-        return response
+            raw = await _call_anthropic(ACTIVE_SYSTEM_PROMPT, messages)
+
+            # Normalise error_type before Pydantic validation to handle any
+            # enum values the model returns that aren't in our allowed list.
+            response = FeedbackResponse(
+                corrected_sentence=raw["corrected_sentence"],
+                is_correct=raw["is_correct"],
+                errors=[ErrorDetail(**_normalise_error(e)) for e in raw.get("errors", [])],
+                difficulty=raw["difficulty"],
+            )
+
+            cache_service.set_cached(cache_key, response)
+            # Resolve the Future so all waiters from Layer 2 receive the result.
+            future.set_result(response)
+
+            logger.info(
+                "LLM call complete [is_correct=%s, errors=%d, difficulty=%s]",
+                response.is_correct,
+                len(response.errors),
+                response.difficulty,
+            )
+            return response
+
+        except Exception as exc:
+            # Propagate the exception to all Layer-2 waiters so they fail fast
+            # rather than hanging indefinitely.
+            if not future.done():
+                future.set_exception(exc)
+            raise
+
+        finally:
+            # Always remove the Future from the map so subsequent requests
+            # (after this one completes) start fresh and hit the cache.
+            _in_flight.pop(cache_key, None)

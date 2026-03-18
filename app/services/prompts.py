@@ -1,23 +1,36 @@
 """Versioned, modular prompt templates for language feedback.
 
 Keeping prompts in their own module means:
-  - Prompt changes can be reviewed, tested, and rolled back independently
-    of the business logic that calls the LLM.
-  - A/B testing is trivial: add SYSTEM_PROMPT_V2, update ACTIVE_SYSTEM_PROMPT.
+  - Prompt changes can be reviewed, tested, and rolled back independently.
+  - A/B testing is trivial: add SYSTEM_PROMPT_V2, update ACTIVE_*.
   - Token counts are easy to audit and optimise in one place.
 
-Design goals for the prompts:
-  1. Accuracy over verbosity — be explicit about rules without padding.
-  2. Script-agnostic — no Latin-centric assumptions; tested with CJK, Cyrillic,
-     Arabic, and Devanagari inputs.
-  3. Anti-hallucination guardrails — explicit instructions to return
-     is_correct=true and an empty errors array for correct sentences,
-     preventing the model from inventing phantom mistakes.
-  4. Native-language explanations — the model must write every explanation
-     in the *learner's* language, not the target language.
+Few-shot strategy (Anthropic tool-use):
+  Anthropic's API enforces a strict rule: every tool_use block in an
+  assistant message must be immediately followed by a tool_result block in
+  the next user message.  To fit two examples without violating this rule
+  and without creating consecutive user messages (also forbidden), the
+  messages are structured as:
+
+    [0] user:      Example 1 input
+    [1] assistant: tool_use  (id=fs_A)
+    [2] user:      tool_result(fs_A)  +  Example 2 input   ← MERGED
+    [3] assistant: tool_use  (id=fs_B)
+    --- runtime ---
+    [4] user:      tool_result(fs_B)  +  actual request    ← MERGED at runtime
+
+  The merge at position [4] happens in LLMService.get_feedback() using
+  FEW_SHOT_LAST_TOOL_USE_ID so the prefix and runtime code stay decoupled.
+
+  Why turn-based few-shot beats system-prompt examples:
+    The model has never "seen" itself call the tool in a text description.
+    Showing real tool_use blocks in prior turns grounds the output schema
+    more reliably, especially for the is_correct=true / empty-errors case.
 """
 
-# ── Version 1 ─────────────────────────────────────────────────────────────────
+from typing import Any
+
+# ── Version 1: system prompt ──────────────────────────────────────────────────
 
 SYSTEM_PROMPT_V1 = """\
 You are a precise language tutor analysing student-written sentences.
@@ -40,15 +53,109 @@ Critical rules — follow these exactly:
 - Keep explanations concise and learner-friendly (1–2 sentences each).\
 """
 
-# The user message is a lightweight template — only the three request fields
-# are injected.  Keeping it short reduces input tokens without losing context.
+# ── Version 1: user message template ─────────────────────────────────────────
+
 USER_PROMPT_V1 = (
     "Sentence: {sentence}\n"
     "Target language: {target_language}\n"
     "Learner's native language: {native_language}"
 )
 
-# ── Active versions — change these to roll out a new prompt globally ──────────
+# ── Few-shot conversation prefix ──────────────────────────────────────────────
+# See module docstring for the structural rationale.
+#
+# Two examples are enough to anchor the model:
+#   Example A — French gender agreement error  → demonstrates error detection,
+#               native-language explanation, minimal correction, CEFR rating.
+#   Example B — Correct German sentence        → demonstrates is_correct=true,
+#               empty errors, corrected_sentence == original (anti-hallucination).
+
+FEW_SHOT_PREFIX: list[dict[str, Any]] = [
+    # ── Example A: one gender-agreement error in French ───────────────────────
+    {
+        "role": "user",
+        "content": (
+            "Sentence: Je suis allé au magasin avec ma ami.\n"
+            "Target language: French\n"
+            "Learner's native language: English"
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "fs_A",
+                "name": "language_feedback",
+                "input": {
+                    "corrected_sentence": "Je suis allé au magasin avec mon ami.",
+                    "is_correct": False,
+                    "errors": [
+                        {
+                            "original": "ma ami",
+                            "correction": "mon ami",
+                            "error_type": "gender_agreement",
+                            "explanation": (
+                                "'Ami' (friend) is masculine in French. "
+                                "Use the masculine possessive 'mon', not the feminine 'ma'."
+                            ),
+                        }
+                    ],
+                    "difficulty": "A2",
+                },
+            }
+        ],
+    },
+    # After a tool_use assistant turn, the next user turn MUST contain a
+    # tool_result block.  We merge that required result with Example B's input
+    # so the messages list stays valid without adding an extra turn.
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "fs_A",
+                "content": "Feedback recorded.",
+            },
+            {
+                "type": "text",
+                "text": (
+                    "Sentence: Ich lese jeden Tag ein Buch.\n"
+                    "Target language: German\n"
+                    "Learner's native language: English"
+                ),
+            },
+        ],
+    },
+    # ── Example B: correct German sentence — no errors ────────────────────────
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "fs_B",
+                "name": "language_feedback",
+                "input": {
+                    "corrected_sentence": "Ich lese jeden Tag ein Buch.",
+                    "is_correct": True,
+                    "errors": [],
+                    "difficulty": "A1",
+                },
+            }
+        ],
+    },
+    # NOTE: The tool_result for fs_B is NOT included here.
+    # It is merged with the actual user request at runtime in
+    # LLMService.get_feedback() using FEW_SHOT_LAST_TOOL_USE_ID below.
+]
+
+# The ID of the last tool_use in FEW_SHOT_PREFIX — used by LLMService to
+# construct the merged tool_result + actual-request user message.
+FEW_SHOT_LAST_TOOL_USE_ID = "fs_B"
+
+# ── Active versions — change these to roll out new prompts globally ───────────
 
 ACTIVE_SYSTEM_PROMPT = SYSTEM_PROMPT_V1
 ACTIVE_USER_PROMPT = USER_PROMPT_V1
+ACTIVE_FEW_SHOT_PREFIX = FEW_SHOT_PREFIX
+ACTIVE_FEW_SHOT_LAST_TOOL_USE_ID = FEW_SHOT_LAST_TOOL_USE_ID

@@ -1,16 +1,23 @@
-"""Pydantic v2 request and response models.
+"""Pydantic v2 request and response models with strict validation.
 
 All field types and constraints mirror schema/response.schema.json exactly,
-so Pydantic acts as a second validation gate on top of JSON Schema — any
-LLM output that slips past tool_use schema enforcement is caught here.
+so Pydantic acts as a second validation gate on top of Anthropic's tool-use
+schema enforcement.
+
+Input hardening:
+  FeedbackRequest strips invisible Unicode control characters (category Cc/Cf)
+  before processing to prevent prompt injection via zero-width joiners, RTL
+  overrides, or other formatting tricks that could confuse the LLM without
+  being visible in the raw JSON.
 """
 
-from typing import Literal
+import unicodedata
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-# Centralise the allowed enum values so they're shared between the Pydantic
-# model, the Anthropic tool definition, and any future OpenAPI documentation.
+# Centralised enum values — shared by Pydantic models, the Anthropic tool
+# definition, and _normalise_error() in llm.py.
 ErrorType = Literal[
     "grammar",
     "spelling",
@@ -49,24 +56,55 @@ class FeedbackRequest(BaseModel):
     """Incoming POST /feedback request body.
 
     Attributes:
-        sentence: The learner's sentence to be analysed.
+        sentence: The learner's sentence to be analysed (max 2000 chars).
         target_language: The language the learner is practising.
         native_language: The learner's first language; explanations are written in this language.
     """
 
-    sentence: str = Field(min_length=1, description="The learner's sentence in the target language")
+    sentence: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="The learner's sentence in the target language (max 2000 characters)",
+    )
     target_language: str = Field(min_length=2, description="Language being studied")
     native_language: str = Field(
         min_length=2,
         description="Learner's first language — explanations will be written in this language",
     )
 
+    @field_validator("sentence", mode="before")
+    @classmethod
+    def strip_invisible_unicode(cls, v: str) -> str:
+        """Remove invisible Unicode control/format characters from the sentence.
+
+        Characters in categories Cc (control) and Cf (format) — such as
+        zero-width joiners, RTL/LTR overrides, and soft hyphens — are invisible
+        in JSON payloads but can confuse the LLM or be used for prompt injection.
+
+        Args:
+            v: Raw sentence string from the request.
+
+        Returns:
+            The sentence with all Cc/Cf characters removed.
+
+        Raises:
+            ValueError: If the sentence contains only invisible characters.
+        """
+        cleaned = "".join(
+            c for c in v if unicodedata.category(c) not in {"Cc", "Cf"}
+        )
+        if not cleaned.strip():
+            raise ValueError(
+                "sentence must contain at least one visible character after stripping control characters"
+            )
+        return cleaned
+
 
 class FeedbackResponse(BaseModel):
     """Structured correction feedback returned by POST /feedback.
 
     Attributes:
-        corrected_sentence: Minimal correction that preserves the learner's voice.
+        corrected_sentence: Minimal correction preserving the learner's voice.
             Identical to the input when is_correct is True.
         is_correct: True only when the sentence has zero errors.
         errors: Ordered list of identified errors; empty when is_correct is True.
@@ -82,3 +120,57 @@ class FeedbackResponse(BaseModel):
         description="Empty list when the sentence is correct",
     )
     difficulty: CefrLevel = Field(description="CEFR complexity rating of the input sentence")
+
+
+# ── Batch endpoint models ─────────────────────────────────────────────────────
+
+
+class BatchFeedbackRequest(BaseModel):
+    """Request body for POST /feedback/batch.
+
+    Attributes:
+        sentences: 1–10 sentences to analyse in the same language pair.
+            All requests share the same target and native language.
+        target_language: The language all sentences are written in.
+        native_language: The learner's first language for explanations.
+    """
+
+    sentences: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(
+        min_length=1,
+        max_length=10,
+        description="1 to 10 sentences to analyse (same language pair for all)",
+    )
+    target_language: str = Field(min_length=2, description="Language being studied")
+    native_language: str = Field(min_length=2, description="Learner's native language")
+
+
+class BatchFeedbackItem(BaseModel):
+    """A single result within a batch response.
+
+    Exactly one of ``result`` or ``error`` will be populated.
+
+    Attributes:
+        sentence: The original sentence that was analysed.
+        result: Populated on success; None on failure.
+        error: Human-readable error message on failure; None on success.
+    """
+
+    sentence: str
+    result: FeedbackResponse | None = None
+    error: str | None = None
+
+
+class BatchFeedbackResponse(BaseModel):
+    """Response body for POST /feedback/batch.
+
+    Attributes:
+        results: Per-sentence feedback items in the same order as the request.
+        total: Total number of sentences submitted.
+        succeeded: Number of sentences successfully analysed.
+        failed: Number of sentences that encountered an error.
+    """
+
+    results: list[BatchFeedbackItem]
+    total: int
+    succeeded: int
+    failed: int
